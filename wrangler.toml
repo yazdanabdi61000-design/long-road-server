@@ -1,4 +1,4 @@
-name = "long-road-rooms"
+name = "long-road-3d-server"
 main = "worker.js"
 compatibility_date = "2025-11-01"
 
