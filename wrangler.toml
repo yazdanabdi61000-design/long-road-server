@@ -1,0 +1,11 @@
+name = "long-road-rooms"
+main = "worker.js"
+compatibility_date = "2025-11-01"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "Room"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]
