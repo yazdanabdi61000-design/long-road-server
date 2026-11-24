@@ -1,530 +1,277 @@
-/* LONG ROAD 3D - STABLE MOVEMENT v4 */
-const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const MAX_PLAYERS = 5;
 
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
-  'Access-Control-Max-Age': '86400'
-};
+const ALPHABET='ABCDEFGHJKLMNPQRSTUVWXYZ23456789',MAX_PLAYERS=5;
+const CORS={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'Content-Type','Access-Control-Max-Age':'86400'};
+const json=(o,s=200)=>new Response(JSON.stringify(o),{status:s,headers:{...CORS,'Content-Type':'application/json; charset=utf-8'}});
+const fail=(m,s=400)=>json({error:m},s);
+function makeCode(){const a=new Uint8Array(6);crypto.getRandomValues(a);return [...a].map(b=>ALPHABET[b%ALPHABET.length]).join('')}
+function randomHex(n){const a=new Uint8Array(n);crypto.getRandomValues(a);return [...a].map(b=>b.toString(16).padStart(2,'0')).join('')}
+function cleanText(v,n){return String(v==null?'':v).replace(/[\u0000-\u001f<>]/g,'').trim().slice(0,n)}
+async function sha256(t){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(t));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')}
+async function readBody(r){try{return await r.json()}catch(e){return {}}}
 
-const json = (obj, status = 200) =>
-  new Response(JSON.stringify(obj), {
-    status,
-    headers: {
-      ...CORS,
-      'Content-Type': 'application/json; charset=utf-8'
-    }
-  });
+export default {async fetch(request,env){
+ const url=new URL(request.url);
+ if(request.method==='OPTIONS')return new Response(null,{status:204,headers:CORS});
+ if(url.pathname==='/'||url.pathname==='/health')return json({ok:true,service:'long-road-rooms',version:5});
 
-const fail = (message, status = 400) => json({ error: message }, status);
-
-function makeCode() {
-  const a = new Uint8Array(6);
-  crypto.getRandomValues(a);
-  return [...a].map(b => ALPHABET[b % ALPHABET.length]).join('');
-}
-
-function randomHex(n) {
-  const a = new Uint8Array(n);
-  crypto.getRandomValues(a);
-  return [...a].map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-function cleanText(v, max) {
-  return String(v == null ? '' : v)
-    .replace(/[\u0000-\u001f<>]/g, '')
-    .trim()
-    .slice(0, max);
-}
-
-async function sha256(text) {
-  const buf = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(text)
-  );
-
-  return [...new Uint8Array(buf)]
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
-async function readBody(request) {
-  try {
-    return await request.json();
-  } catch (e) {
-    return {};
+ if(request.method==='POST'&&url.pathname==='/api/create'){
+  const b=await readBody(request),name=cleanText(b.name,18)||'بازیکن',roomName=cleanText(b.roomName,24)||'اتاق دوستان',passwordEnabled=!!b.passwordEnabled,password=String(b.password||'').slice(0,24);
+  if(passwordEnabled&&password.length<4)return fail('رمز باید حداقل ۴ نویسه باشد.');
+  for(let i=0;i<6;i++){
+   const code=makeCode(),stub=env.ROOMS.get(env.ROOMS.idFromName(code));
+   const res=await stub.fetch('https://room/init',{method:'POST',body:JSON.stringify({roomName,passwordEnabled,password,name,cid:b.cid})});
+   if(res.status===409)continue;
+   if(!res.ok)return fail('ساخت اتاق انجام نشد.',500);
+   const r=await res.json(),proto=url.protocol==='https:'?'wss':'ws';
+   return json({code,roomName,wsUrl:proto+'://'+url.host+'/ws/'+code+'?ticket='+r.ticket});
   }
-}
+  return fail('ساخت اتاق انجام نشد؛ دوباره تلاش کن.',500);
+ }
 
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
+ if(request.method==='POST'&&url.pathname==='/api/join'){
+  const b=await readBody(request),code=String(b.code||'').trim().toUpperCase();
+  if(!/^[A-Z0-9]{6}$/.test(code))return fail('کد اتاق باید ۶ نویسه باشد.');
+  const stub=env.ROOMS.get(env.ROOMS.idFromName(code));
+  const res=await stub.fetch('https://room/join',{method:'POST',body:JSON.stringify({name:cleanText(b.name,18)||'بازیکن',password:String(b.password||''),cid:b.cid})});
+  const r=await res.json().catch(()=>({}));
+  if(!res.ok)return fail(r.error||'ورود به اتاق انجام نشد.',res.status);
+  const proto=url.protocol==='https:'?'wss':'ws';
+  return json({code,roomName:r.roomName,wsUrl:proto+'://'+url.host+'/ws/'+code+'?ticket='+r.ticket});
+ }
 
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: CORS
-      });
-    }
+ const m=url.pathname.match(/^\/ws\/([A-Z0-9]{6})$/);
+ if(m){
+  if(request.headers.get('Upgrade')!=='websocket')return fail('WebSocket لازم است.',426);
+  return env.ROOMS.get(env.ROOMS.idFromName(m[1])).fetch(request);
+ }
+ return fail('پیدا نشد.',404);
+}};
 
-    if (url.pathname === '/' || url.pathname === '/health') {
-      return json({
-        ok: true,
-        service: 'long-road-rooms'
-      });
-    }
+export class Room{
+ constructor(state,env){
+  this.state=state;this.players=new Map();this.ownerId=null;this.cfg=null;this.loaded=false;
+  this.worldState={vehicles:[],items:[],removed:[]};this.vehicleOwners=new Map();this.lastWorldPersist=0;
+ }
 
-    if (request.method === 'POST' && url.pathname === '/api/create') {
-      const body = await readBody(request);
+ async load(){
+  if(this.loaded)return;
+  this.cfg=await this.state.storage.get('cfg')||null;
+  this.worldState=await this.state.storage.get('worldState')||{vehicles:[],items:[],removed:[]};
+  this.loaded=true;
+ }
 
-      const name = cleanText(body.name, 18) || 'بازیکن';
-      const roomName = cleanText(body.roomName, 24) || 'اتاق دوستان';
-      const passwordEnabled = !!body.passwordEnabled;
-      const password = String(body.password || '').slice(0, 24);
+ async fetch(request){
+  await this.load();
+  const u=new URL(request.url);
+  if(u.pathname==='/init')return this.init(request);
+  if(u.pathname==='/join')return this.join(request);
+  if(u.pathname.startsWith('/ws/'))return this.connect(u);
+  return new Response('not found',{status:404});
+ }
 
-      if (passwordEnabled && password.length < 4) {
-        return fail('رمز باید حداقل ۴ نویسه باشد.');
-      }
+ async issueTicket(name,owner,cid){
+  const t=randomHex(12);
+  await this.state.storage.put('tk:'+t,{name,owner,cid:cleanText(cid,48),exp:Date.now()+60000});
+  return t;
+ }
 
-      for (let i = 0; i < 6; i++) {
-        const code = makeCode();
-        const stub = env.ROOMS.get(env.ROOMS.idFromName(code));
+ async init(request){
+  if(this.cfg)return new Response('exists',{status:409});
+  const b=await request.json(),salt=randomHex(8);
+  this.cfg={roomName:b.roomName,salt,hash:b.passwordEnabled?await sha256(salt+b.password):null,started:false};
+  await this.state.storage.put('cfg',this.cfg);
+  await this.state.storage.setAlarm(Date.now()+600000);
+  return Response.json({ticket:await this.issueTicket(b.name,true,b.cid)});
+ }
 
-        const res = await stub.fetch('https://room/init', {
-          method: 'POST',
-          body: JSON.stringify({
-            roomName,
-            passwordEnabled,
-            password,
-            name,
-            cid: body.cid
-          })
-        });
+ async join(request){
+  if(!this.cfg)return Response.json({error:'اتاقی با این کد پیدا نشد.'},{status:404});
+  const b=await request.json(),cid=cleanText(b.cid,48);
+  if(this.cfg.hash&&(await sha256(this.cfg.salt+b.password))!==this.cfg.hash)
+   return Response.json({error:'رمز اتاق اشتباه است.'},{status:403});
+  const same=cid&&[...this.players.values()].some(p=>p.cid===cid);
+  if(this.players.size>=MAX_PLAYERS&&!same)
+   return Response.json({error:'اتاق پر است (حداکثر ۵ نفر).'},{status:409});
+  return Response.json({roomName:this.cfg.roomName,ticket:await this.issueTicket(b.name,false,cid)});
+ }
 
-        if (res.status === 409) continue;
-        if (!res.ok) return fail('ساخت اتاق انجام نشد.', 500);
+ async connect(url){
+  if(!this.cfg)return new Response('room not found',{status:404});
+  const t=url.searchParams.get('ticket')||'',rec=await this.state.storage.get('tk:'+t);
+  if(!rec||rec.exp<Date.now())return new Response('bad ticket',{status:403});
+  await this.state.storage.delete('tk:'+t);
 
-        const r = await res.json();
-        const proto = url.protocol === 'https:' ? 'wss' : 'ws';
-
-        return json({
-          code,
-          roomName,
-          wsUrl: proto + '://' + url.host +
-            '/ws/' + code + '?ticket=' + r.ticket
-        });
-      }
-
-      return fail('ساخت اتاق انجام نشد؛ دوباره تلاش کن.', 500);
-    }
-
-    if (request.method === 'POST' && url.pathname === '/api/join') {
-      const body = await readBody(request);
-      const code = String(body.code || '').trim().toUpperCase();
-
-      if (!/^[A-Z0-9]{6}$/.test(code)) {
-        return fail('کد اتاق باید ۶ نویسه باشد.');
-      }
-
-      const name = cleanText(body.name, 18) || 'بازیکن';
-      const stub = env.ROOMS.get(env.ROOMS.idFromName(code));
-
-      const res = await stub.fetch('https://room/join', {
-        method: 'POST',
-        body: JSON.stringify({
-          name,
-          password: String(body.password || ''),
-          cid: body.cid
-        })
-      });
-
-      const r = await res.json().catch(() => ({}));
-
-      if (!res.ok) {
-        return fail(r.error || 'ورود به اتاق انجام نشد.', res.status);
-      }
-
-      const proto = url.protocol === 'https:' ? 'wss' : 'ws';
-
-      return json({
-        code,
-        roomName: r.roomName,
-        wsUrl: proto + '://' + url.host +
-          '/ws/' + code + '?ticket=' + r.ticket
-      });
-    }
-
-    const m = url.pathname.match(/^\/ws\/([A-Z0-9]{6})$/);
-
-    if (m) {
-      if (request.headers.get('Upgrade') !== 'websocket') {
-        return fail('WebSocket لازم است.', 426);
-      }
-
-      const stub = env.ROOMS.get(env.ROOMS.idFromName(m[1]));
-      return stub.fetch(request);
-    }
-
-    return fail('پیدا نشد.', 404);
-  }
-};
-
-export class Room {
-  constructor(state, env) {
-    this.state = state;
-    this.players = new Map();
-    this.ownerId = null;
-    this.cfg = null;
-    this.loaded = false;
+  if(rec.cid){
+   const old=[...this.players.entries()].find(([,p])=>p.cid===rec.cid);
+   if(old){
+    const [oid,op]=old;
+    if(this.ownerId===oid)rec.owner=true;
+    await this.onLeave(oid);
+    try{op.ws.close(4001,'reconnected')}catch(e){}
+   }
   }
 
-  async load() {
-    if (this.loaded) return;
+  if(this.players.size>=MAX_PLAYERS)return new Response('room full',{status:409});
+  const pair=new WebSocketPair(),client=pair[0],server=pair[1];
+  server.accept();
+  const id=randomHex(5);
+  const data={id,name:rec.name,x:0,y:0,z:0,yaw:0,mode:'foot',skin:0,vt:'car',seat:0,ride:'',sl:0,held:'',heldCol:null,vehKey:'',tod:0.33};
+  this.players.set(id,{ws:server,data,last:0,cid:rec.cid||''});
+  if(rec.owner||!this.ownerId||!this.players.has(this.ownerId))this.ownerId=id;
 
-    this.cfg = (await this.state.storage.get('cfg')) || null;
-    this.loaded = true;
+  const others=[...this.players.values()].filter(p=>p.data.id!==id).map(p=>p.data);
+  this.send(server,{type:'welcome',id,isOwner:this.ownerId===id,ownerId:this.ownerId,roomName:this.cfg.roomName,started:this.cfg.started,players:others,count:this.players.size});
+
+  if(this.worldState.items.length||this.worldState.vehicles.length||this.worldState.removed.length)
+   this.send(server,{type:'world',...this.worldState});
+
+  this.broadcast(id,{type:'joined',player:data,count:this.players.size});
+  server.addEventListener('message',ev=>this.onMessage(id,ev));
+  const leave=()=>this.onLeave(id);
+  server.addEventListener('close',leave);
+  server.addEventListener('error',leave);
+  return new Response(null,{status:101,webSocket:client});
+ }
+
+ num(v,l){
+  v=Number(v);
+  return Number.isFinite(v)?Math.max(-l,Math.min(l,v)):0;
+ }
+
+ async onMessage(id,ev){
+  const p=this.players.get(id);
+  if(!p||typeof ev.data!=='string'||ev.data.length>100000)return;
+  let m;
+  try{m=JSON.parse(ev.data)}catch(e){return}
+
+  if(m.type==='ping'){this.send(p.ws,{type:'pong'});return}
+  if(m.type==='bye'){
+   this.onLeave(id);
+   try{p.ws.close(1000,'left')}catch(e){}
+   return;
   }
 
-  async fetch(request) {
-    await this.load();
+  if(m.type==='state'){
+   if(Date.now()-p.last<25)return;
+   p.last=Date.now();
+   const mode=m.mode==='car'?'car':'foot';
+   const seat=Math.max(0,Math.min(4,Math.floor(Number(m.seat)||0)));
+   const key=cleanText(m.vehKey,100);
 
-    const url = new URL(request.url);
+   if(mode==='car'&&seat===0&&key){
+    const by=this.vehicleOwners.get(key);
+    if(by&&by!==id){
+     this.send(p.ws,{type:'vehicle_busy',key});
+     return;
+    }
+    this.vehicleOwners.set(key,id);
+   }else if(p.data.vehKey&&this.vehicleOwners.get(p.data.vehKey)===id){
+    this.vehicleOwners.delete(p.data.vehKey);
+   }
 
-    if (url.pathname === '/init') return this.init(request);
-    if (url.pathname === '/join') return this.join(request);
-    if (url.pathname.startsWith('/ws/')) return this.connect(url);
-
-    return new Response('not found', { status: 404 });
+   Object.assign(p.data,{
+    x:this.num(m.x,1e6),y:this.num(m.y,1000),z:this.num(m.z,1e6),
+    yaw:this.num(m.yaw,100),mode,
+    skin:Math.max(0,Math.min(3,Math.floor(Number(m.skin)||0))),
+    vt:m.vt==='moto'?'moto':m.vt==='truck'?'truck':'car',
+    seat,ride:cleanText(m.ride,32),sl:m.sl?1:0,
+    held:cleanText(m.held,32),
+    heldCol:typeof m.heldCol==='string'?cleanText(m.heldCol,16):null,
+    vehKey:key,tod:this.num(m.tod,1)
+   });
+   this.broadcast(id,{type:'state',player:p.data});
+   return;
   }
 
-  async issueTicket(name, owner, cid) {
-    const t = randomHex(12);
+  if(m.type==='world'){
+   const removed=new Set(this.worldState.removed||[]);
+   for(const x of (Array.isArray(m.removed)?m.removed.slice(-500):[]))
+    if(typeof x==='string'&&x.length<=180)removed.add(x);
 
-    await this.state.storage.put('tk:' + t, {
-      name,
-      owner,
-      cid: cleanText(cid, 48),
-      exp: Date.now() + 60000
+   if(removed.size>3000){
+    const keep=[...removed].slice(-2000);
+    removed.clear();keep.forEach(x=>removed.add(x));
+   }
+
+   const items=new Map((this.worldState.items||[]).map(x=>[x.netId,x]));
+   for(const x of (Array.isArray(m.items)?m.items.slice(0,180):[])){
+    if(!x||typeof x.netId!=='string'||x.netId.length>180||removed.has(x.netId)||typeof x.type!=='string'||!/^[a-zA-Z0-9:_-]+$/.test(x.type))continue;
+    items.set(x.netId,{
+     netId:x.netId,type:x.type,
+     x:this.num(x.x,1e6),y:this.num(x.y,1000),z:this.num(x.z,1e6),
+     ry:this.num(x.ry,100),uses:this.num(x.uses,10000),
+     col:typeof x.col==='string'?cleanText(x.col,16):null
     });
+   }
 
-    return t;
-  }
-
-  async init(request) {
-    if (this.cfg) {
-      return new Response('exists', { status: 409 });
-    }
-
-    const b = await request.json();
-    const salt = randomHex(8);
-
-    this.cfg = {
-      roomName: b.roomName,
-      salt,
-      hash: b.passwordEnabled
-        ? await sha256(salt + b.password)
-        : null,
-      started: false
-    };
-
-    await this.state.storage.put('cfg', this.cfg);
-    await this.state.storage.setAlarm(Date.now() + 10 * 60 * 1000);
-
-    const ticket = await this.issueTicket(b.name, true, b.cid);
-
-    return Response.json({ ticket });
-  }
-
-  async join(request) {
-    if (!this.cfg) {
-      return Response.json(
-        { error: 'اتاقی با این کد پیدا نشد.' },
-        { status: 404 }
-      );
-    }
-
-    const b = await request.json();
-
-    if (
-      this.cfg.hash &&
-      (await sha256(this.cfg.salt + b.password)) !== this.cfg.hash
-    ) {
-      return Response.json(
-        { error: 'رمز اتاق اشتباه است.' },
-        { status: 403 }
-      );
-    }
-
-    const cid = cleanText(b.cid, 48);
-
-    const alreadyHere = cid &&
-      [...this.players.values()].some(p => p.cid === cid);
-
-    if (this.players.size >= MAX_PLAYERS && !alreadyHere) {
-      return Response.json(
-        { error: 'اتاق پر است (حداکثر ۵ نفر).' },
-        { status: 409 }
-      );
-    }
-
-    const ticket = await this.issueTicket(b.name, false, cid);
-
-    return Response.json({
-      roomName: this.cfg.roomName,
-      ticket
+   for(const x of removed)items.delete(x);
+   const vehicles=new Map((this.worldState.vehicles||[]).map(x=>[x.key,x]));
+   for(const x of (Array.isArray(m.vehicles)?m.vehicles.slice(0,8):[])){
+    if(!x||typeof x.key!=='string'||x.key.length>100)continue;
+    const by=this.vehicleOwners.get(x.key);
+    if(by&&by!==id)continue;
+    if(!by&&!(p.data.mode==='car'&&p.data.seat===0&&p.data.vehKey===x.key))continue;
+    const ph=x.phys||{};
+    vehicles.set(x.key,{
+     key:x.key,
+     phys:{
+      x:this.num(ph.x,1e6),y:this.num(ph.y,1000),z:this.num(ph.z,1e6),
+      psi:this.num(ph.psi,100),v:this.num(ph.v,1000),steer:this.num(ph.steer,10)
+     },
+     state:x.state||{}
     });
+   }
+
+   this.worldState={
+    vehicles:[...vehicles.values()].slice(-100),
+    items:[...items.values()].slice(-500),
+    removed:[...removed].slice(-2000)
+   };
+
+   if(Date.now()-this.lastWorldPersist>1000){
+    this.lastWorldPersist=Date.now();
+    await this.state.storage.put('worldState',this.worldState);
+   }
+   this.broadcast(id,{type:'world',...this.worldState});
+   return;
   }
 
-  async connect(url) {
-    if (!this.cfg) {
-      return new Response('room not found', { status: 404 });
-    }
-
-    const t = url.searchParams.get('ticket') || '';
-    const rec = await this.state.storage.get('tk:' + t);
-
-    if (!rec || rec.exp < Date.now()) {
-      return new Response('bad ticket', { status: 403 });
-    }
-
-    await this.state.storage.delete('tk:' + t);
-
-    // Replace an older connection from the same device.
-    if (rec.cid) {
-      const old = [...this.players.entries()]
-        .find(([, p]) => p.cid === rec.cid);
-
-      if (old) {
-        const [oldId, oldPlayer] = old;
-        const wasOwner = this.ownerId === oldId;
-
-        if (wasOwner) rec.owner = true;
-
-        await this.onLeave(oldId);
-
-        try {
-          oldPlayer.ws.close(4001, 'reconnected');
-        } catch (e) {}
-      }
-    }
-
-    if (this.players.size >= MAX_PLAYERS) {
-      return new Response('room full', { status: 409 });
-    }
-
-    const pair = new WebSocketPair();
-    const client = pair[0];
-    const server = pair[1];
-
-    server.accept();
-
-    const id = randomHex(5);
-
-    const data = {
-      id,
-      name: rec.name,
-      x: 0,
-      y: 0,
-      z: 0,
-      yaw: 0,
-      mode: 'foot',
-      skin: 0,
-      vt: 'car',
-      seat: 0
-    };
-
-    this.players.set(id, {
-      ws: server,
-      data,
-      last: 0,
-      lastWorld: 0,
-      cid: rec.cid || ''
-    });
-
-    if (rec.owner || !this.players.has(this.ownerId)) {
-      this.ownerId = id;
-    }
-
-    const others = [...this.players.values()]
-      .filter(p => p.data.id !== id)
-      .map(p => p.data);
-
-    this.send(server, {
-      type: 'welcome',
-      id,
-      isOwner: this.ownerId === id,
-      roomName: this.cfg.roomName,
-      started: this.cfg.started,
-      players: others,
-      count: this.players.size
-    });
-
-    this.broadcast(id, {
-      type: 'joined',
-      player: data,
-      count: this.players.size
-    });
-
-    server.addEventListener('message', ev => this.onMessage(id, ev));
-
-    const leave = () => this.onLeave(id);
-
-    server.addEventListener('close', leave);
-    server.addEventListener('error', leave);
-
-    return new Response(null, {
-      status: 101,
-      webSocket: client
-    });
+  if(m.type==='start'&&id===this.ownerId&&this.players.size>=2&&!this.cfg.started){
+   this.cfg.started=true;
+   await this.state.storage.put('cfg',this.cfg);
+   this.broadcast(null,{type:'start'});
   }
+ }
 
-  num(v, lim) {
-    v = Number(v);
-
-    return Number.isFinite(v)
-      ? Math.max(-lim, Math.min(lim, v))
-      : 0;
+ async onLeave(id){
+  const p=this.players.get(id);
+  if(!p||!this.players.delete(id))return;
+  for(const [k,v] of this.vehicleOwners)if(v===id)this.vehicleOwners.delete(k);
+  this.broadcast(null,{type:'left',id,count:this.players.size});
+  if(this.ownerId===id){
+   const next=this.players.keys().next().value;
+   this.ownerId=next||null;
+   if(next)this.send(this.players.get(next).ws,{type:'owner',id:next});
   }
+  if(!this.players.size)await this.state.storage.setAlarm(Date.now()+120000);
+ }
 
-  onMessage(id, ev) {
-    const p = this.players.get(id);
+ async alarm(){
+  await this.load();
+  if(!this.players.size){
+   await this.state.storage.deleteAll();
+   this.cfg=null;
+   this.worldState={vehicles:[],items:[],removed:[]};
+  }else await this.state.storage.setAlarm(Date.now()+600000);
+ }
 
-    if (!p || typeof ev.data !== 'string' || ev.data.length > 600) {
-      return;
-    }
+ send(ws,o){try{ws.send(JSON.stringify(o))}catch(e){}}
 
-    let msg;
-
-    try {
-      msg = JSON.parse(ev.data);
-    } catch (e) {
-      return;
-    }
-
-    if (msg.type === 'ping') {
-      this.send(p.ws, { type: 'pong' });
-      return;
-    }
-
-    if (msg.type === 'bye') {
-      this.onLeave(id);
-
-      try {
-        p.ws.close(1000, 'left');
-      } catch (e) {}
-
-      return;
-    }
-
-    if (msg.type === 'state') {
-      const now = Date.now();
-
-      if (now - p.last < 25) return;
-      p.last = now;
-
-      const d = p.data;
-
-      d.x = this.num(msg.x, 1e6);
-      d.y = this.num(msg.y, 1000);
-      d.z = this.num(msg.z, 1e6);
-      d.yaw = this.num(msg.yaw, 100);
-
-      d.mode = msg.mode === 'car' ? 'car' : 'foot';
-
-      d.skin = Math.max(
-        0,
-        Math.min(3, Math.floor(Number(msg.skin) || 0))
-      );
-
-      d.vt = msg.vt === 'moto' || msg.vt === 'truck'
-        ? msg.vt
-        : 'car';
-
-      d.seat = Math.max(
-        0,
-        Math.min(4, Math.floor(Number(msg.seat) || 0))
-      );
-
-      this.broadcast(id, {
-        type: 'state',
-        player: d
-      });
-
-    } else if (msg.type === 'start') {
-      if (
-        id === this.ownerId &&
-        this.players.size >= 2 &&
-        !this.cfg.started
-      ) {
-        this.cfg.started = true;
-
-        this.state.storage.put('cfg', this.cfg);
-
-        this.broadcast(null, {
-          type: 'start'
-        });
-      }
-    }
+ broadcast(except,o){
+  const t=JSON.stringify(o);
+  for(const [id,p] of this.players){
+   if(id===except)continue;
+   try{p.ws.send(t)}catch(e){}
   }
-
-  async onLeave(id) {
-    if (!this.players.delete(id)) return;
-
-    this.broadcast(null, {
-      type: 'left',
-      id,
-      count: this.players.size
-    });
-
-    if (this.ownerId === id) {
-      const next = this.players.keys().next().value;
-
-      this.ownerId = next || null;
-
-      if (next) {
-        this.send(this.players.get(next).ws, {
-          type: 'owner'
-        });
-      }
-    }
-
-    if (this.players.size === 0) {
-      await this.state.storage.setAlarm(
-        Date.now() + 2 * 60 * 1000
-      );
-    }
-  }
-
-  async alarm() {
-    await this.load();
-
-    if (this.players.size === 0) {
-      await this.state.storage.deleteAll();
-      this.cfg = null;
-    } else {
-      await this.state.storage.setAlarm(
-        Date.now() + 10 * 60 * 1000
-      );
-    }
-  }
-
-  send(ws, obj) {
-    try {
-      ws.send(JSON.stringify(obj));
-    } catch (e) {}
-  }
-
-  broadcast(exceptId, obj) {
-    const text = JSON.stringify(obj);
-
-    for (const [pid, p] of this.players) {
-      if (pid === exceptId) continue;
-
-      try {
-        p.ws.send(text);
-      } catch (e) {}
-    }
-  }
+ }
 }
