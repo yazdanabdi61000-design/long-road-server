@@ -1,10 +1,4 @@
-/* LONG ROAD 3D - room server (Cloudflare Worker + Durable Objects)
-   Anyone can create a room (6-char code, optional password, max 5 players).
-   Endpoints used by the game:
-     POST /api/create  {name, roomName, passwordEnabled, password}
-     POST /api/join    {name, code, password}
-     WS   /ws/CODE?ticket=...
-*/
+/* LONG ROAD 3D - STABLE MOVEMENT v4 */
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const MAX_PLAYERS = 5;
 
@@ -50,6 +44,7 @@ async function sha256(text) {
     'SHA-256',
     new TextEncoder().encode(text)
   );
+
   return [...new Uint8Array(buf)]
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
@@ -68,11 +63,17 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: CORS });
+      return new Response(null, {
+        status: 204,
+        headers: CORS
+      });
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return json({ ok: true, service: 'long-road-rooms' });
+      return json({
+        ok: true,
+        service: 'long-road-rooms'
+      });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/create') {
@@ -97,7 +98,8 @@ export default {
             roomName,
             passwordEnabled,
             password,
-            name
+            name,
+            cid: body.cid
           })
         });
 
@@ -133,7 +135,8 @@ export default {
         method: 'POST',
         body: JSON.stringify({
           name,
-          password: String(body.password || '')
+          password: String(body.password || ''),
+          cid: body.cid
         })
       });
 
@@ -196,12 +199,13 @@ export class Room {
     return new Response('not found', { status: 404 });
   }
 
-  async issueTicket(name, owner) {
+  async issueTicket(name, owner, cid) {
     const t = randomHex(12);
 
     await this.state.storage.put('tk:' + t, {
       name,
       owner,
+      cid: cleanText(cid, 48),
       exp: Date.now() + 60000
     });
 
@@ -228,7 +232,7 @@ export class Room {
     await this.state.storage.put('cfg', this.cfg);
     await this.state.storage.setAlarm(Date.now() + 10 * 60 * 1000);
 
-    const ticket = await this.issueTicket(b.name, true);
+    const ticket = await this.issueTicket(b.name, true, b.cid);
 
     return Response.json({ ticket });
   }
@@ -253,14 +257,19 @@ export class Room {
       );
     }
 
-    if (this.players.size >= MAX_PLAYERS) {
+    const cid = cleanText(b.cid, 48);
+
+    const alreadyHere = cid &&
+      [...this.players.values()].some(p => p.cid === cid);
+
+    if (this.players.size >= MAX_PLAYERS && !alreadyHere) {
       return Response.json(
         { error: 'اتاق پر است (حداکثر ۵ نفر).' },
         { status: 409 }
       );
     }
 
-    const ticket = await this.issueTicket(b.name, false);
+    const ticket = await this.issueTicket(b.name, false, cid);
 
     return Response.json({
       roomName: this.cfg.roomName,
@@ -281,6 +290,25 @@ export class Room {
     }
 
     await this.state.storage.delete('tk:' + t);
+
+    // Replace an older connection from the same device.
+    if (rec.cid) {
+      const old = [...this.players.entries()]
+        .find(([, p]) => p.cid === rec.cid);
+
+      if (old) {
+        const [oldId, oldPlayer] = old;
+        const wasOwner = this.ownerId === oldId;
+
+        if (wasOwner) rec.owner = true;
+
+        await this.onLeave(oldId);
+
+        try {
+          oldPlayer.ws.close(4001, 'reconnected');
+        } catch (e) {}
+      }
+    }
 
     if (this.players.size >= MAX_PLAYERS) {
       return new Response('room full', { status: 409 });
@@ -310,7 +338,9 @@ export class Room {
     this.players.set(id, {
       ws: server,
       data,
-      last: 0
+      last: 0,
+      lastWorld: 0,
+      cid: rec.cid || ''
     });
 
     if (rec.owner || !this.players.has(this.ownerId)) {
@@ -352,6 +382,7 @@ export class Room {
 
   num(v, lim) {
     v = Number(v);
+
     return Number.isFinite(v)
       ? Math.max(-lim, Math.min(lim, v))
       : 0;
@@ -360,7 +391,7 @@ export class Room {
   onMessage(id, ev) {
     const p = this.players.get(id);
 
-    if (!p || typeof ev.data !== 'string' || ev.data.length > 24000) {
+    if (!p || typeof ev.data !== 'string' || ev.data.length > 600) {
       return;
     }
 
@@ -369,6 +400,21 @@ export class Room {
     try {
       msg = JSON.parse(ev.data);
     } catch (e) {
+      return;
+    }
+
+    if (msg.type === 'ping') {
+      this.send(p.ws, { type: 'pong' });
+      return;
+    }
+
+    if (msg.type === 'bye') {
+      this.onLeave(id);
+
+      try {
+        p.ws.close(1000, 'left');
+      } catch (e) {}
+
       return;
     }
 
@@ -406,26 +452,6 @@ export class Room {
         player: d
       });
 
-    } else if (msg.type === 'world') {
-      const now = Date.now();
-
-      if (now - (p.lastWorld || 0) < 70) return;
-      p.lastWorld = now;
-
-      this.broadcast(id, {
-        type: 'world',
-        from: id,
-        vehicles: Array.isArray(msg.vehicles)
-          ? msg.vehicles.slice(0, 80)
-          : [],
-        items: Array.isArray(msg.items)
-          ? msg.items.slice(0, 180)
-          : [],
-        removed: Array.isArray(msg.removed)
-          ? msg.removed.slice(-250)
-          : []
-      });
-
     } else if (msg.type === 'start') {
       if (
         id === this.ownerId &&
@@ -433,8 +459,12 @@ export class Room {
         !this.cfg.started
       ) {
         this.cfg.started = true;
+
         this.state.storage.put('cfg', this.cfg);
-        this.broadcast(null, { type: 'start' });
+
+        this.broadcast(null, {
+          type: 'start'
+        });
       }
     }
   }
@@ -450,15 +480,20 @@ export class Room {
 
     if (this.ownerId === id) {
       const next = this.players.keys().next().value;
+
       this.ownerId = next || null;
 
       if (next) {
-        this.send(this.players.get(next).ws, { type: 'owner' });
+        this.send(this.players.get(next).ws, {
+          type: 'owner'
+        });
       }
     }
 
     if (this.players.size === 0) {
-      await this.state.storage.setAlarm(Date.now() + 2 * 60 * 1000);
+      await this.state.storage.setAlarm(
+        Date.now() + 2 * 60 * 1000
+      );
     }
   }
 
@@ -469,7 +504,9 @@ export class Room {
       await this.state.storage.deleteAll();
       this.cfg = null;
     } else {
-      await this.state.storage.setAlarm(Date.now() + 10 * 60 * 1000);
+      await this.state.storage.setAlarm(
+        Date.now() + 10 * 60 * 1000
+      );
     }
   }
 
