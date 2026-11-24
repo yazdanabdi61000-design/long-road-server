@@ -230,6 +230,7 @@ export class Room {
     };
     this.players.set(id, p);
     this.emptySince = 0;
+    const prevOwner = this.ownerId;
     if (!this.ownerId || !this.players.has(this.ownerId)) this.ownerId = id;
 
     ws.addEventListener('message', ev => this.onMessage(p, ev));
@@ -237,11 +238,12 @@ export class Room {
     ws.addEventListener('error', () => this.onGone(p));
 
     this.send(ws, {
-      type: 'welcome', id, isOwner: this.ownerId === id, roomName: this.meta.roomName,
+      type: 'welcome', id, isOwner: this.ownerId === id, ownerId: this.ownerId, roomName: this.meta.roomName,
       started: this.started, count: this.players.size,
       players: [...this.players.values()].filter(q => q.id !== id).map(q => this.pub(q))
     });
     this.broadcast(id, { type: 'joined', player: this.pub(p), count: this.players.size });
+    if (prevOwner !== this.ownerId) this.broadcast(id, { type: 'owner', id: this.ownerId });
     try { await this.state.storage.setAlarm(now + SWEEP_MS); } catch (e) {}
   }
 
@@ -256,9 +258,9 @@ export class Room {
     if (this.ownerId === p.id) {
       const n = [...this.players.values()].sort((a, b) => a.joinedAt - b.joinedAt)[0];
       this.ownerId = n ? n.id : '';
-      if (n) this.send(n.ws, { type: 'owner' });
     }
     this.broadcast(null, { type: 'left', id: p.id, count: this.players.size });
+    if (this.ownerId) this.broadcast(null, { type: 'owner', id: this.ownerId });
     if (!this.players.size) {
       this.started = false;
       this.emptySince = Date.now();
