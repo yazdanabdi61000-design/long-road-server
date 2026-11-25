@@ -1,5 +1,4 @@
-
-const ALPHABET='ABCDEFGHJKLMNPQRSTUVWXYZ23456789',MAX_PLAYERS=5;
+const ALPHABET='ABCDEFGHJKLMNPQRSTUVWXYZ23456789',MAX_PLAYERS=5,ROOM_TTL=30*24*3600*1000;
 const CORS={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'Content-Type','Access-Control-Max-Age':'86400'};
 const json=(o,s=200)=>new Response(JSON.stringify(o),{status:s,headers:{...CORS,'Content-Type':'application/json; charset=utf-8'}});
 const fail=(m,s=400)=>json({error:m},s);
@@ -9,10 +8,20 @@ function cleanText(v,n){return String(v==null?'':v).replace(/[\u0000-\u001f<>]/g
 async function sha256(t){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(t));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')}
 async function readBody(r){try{return await r.json()}catch(e){return {}}}
 
+/* world format: vehicles {key:{phys,state}}, items {netId:item} (only player-dropped 'd:' items), removed [netId] */
+function normalizeWorld(w){
+ const out={vehicles:{},items:{},removed:Array.isArray(w.removed)?w.removed.slice(-2000):[]};
+ if(Array.isArray(w.vehicles)){for(const v of w.vehicles)if(v&&v.key)out.vehicles[v.key]={phys:v.phys||null,state:v.state||{}}}
+ else if(w.vehicles&&typeof w.vehicles==='object')out.vehicles=w.vehicles;
+ if(Array.isArray(w.items)){for(const it of w.items)if(it&&typeof it.netId==='string'&&it.netId.startsWith('d:'))out.items[it.netId]=it}
+ else if(w.items&&typeof w.items==='object')out.items=w.items;
+ return out;
+}
+
 export default {async fetch(request,env){
  const url=new URL(request.url);
  if(request.method==='OPTIONS')return new Response(null,{status:204,headers:CORS});
- if(url.pathname==='/'||url.pathname==='/health')return json({ok:true,service:'long-road-rooms',version:5});
+ if(url.pathname==='/'||url.pathname==='/health')return json({ok:true,service:'long-road-rooms',version:6});
 
  if(request.method==='POST'&&url.pathname==='/api/create'){
   const b=await readBody(request),name=cleanText(b.name,18)||'بازیکن',roomName=cleanText(b.roomName,24)||'اتاق دوستان',passwordEnabled=!!b.passwordEnabled,password=String(b.password||'').slice(0,24);
@@ -50,14 +59,28 @@ export default {async fetch(request,env){
 export class Room{
  constructor(state,env){
   this.state=state;this.players=new Map();this.ownerId=null;this.cfg=null;this.loaded=false;
-  this.worldState={vehicles:[],items:[],removed:[]};this.vehicleOwners=new Map();this.lastWorldPersist=0;
+  this.worldState=normalizeWorld({});this.vehicleOwners=new Map();this.lastWorldPersist=0;this.dirty=false;
  }
 
  async load(){
   if(this.loaded)return;
   this.cfg=await this.state.storage.get('cfg')||null;
-  this.worldState=await this.state.storage.get('worldState')||{vehicles:[],items:[],removed:[]};
+  this.worldState=normalizeWorld(await this.state.storage.get('worldState')||{});
   this.loaded=true;
+ }
+
+ async persist(force){
+  if(!this.dirty)return;
+  if(!force&&Date.now()-this.lastWorldPersist<1500)return;
+  this.lastWorldPersist=Date.now();this.dirty=false;
+  await this.state.storage.put('worldState',this.worldState);
+ }
+
+ worldPayload(){
+  const w=this.worldState;
+  return{type:'world',
+   vehicles:Object.keys(w.vehicles).map(k=>({key:k,phys:w.vehicles[k].phys,state:w.vehicles[k].state})),
+   items:Object.values(w.items),removed:w.removed};
  }
 
  async fetch(request){
@@ -112,18 +135,20 @@ export class Room{
   }
 
   if(this.players.size>=MAX_PLAYERS)return new Response('room full',{status:409});
+  const saved=rec.cid?(await this.state.storage.get('pd:'+rec.cid))||null:null;
   const pair=new WebSocketPair(),client=pair[0],server=pair[1];
   server.accept();
   const id=randomHex(5);
-  const data={id,name:rec.name,x:0,y:0,z:0,yaw:0,mode:'foot',skin:0,vt:'car',seat:0,ride:'',sl:0,held:'',heldCol:null,vehKey:'',tod:0.33};
+  const data={id,name:rec.name,x:0,y:0,z:0,yaw:0,mode:'foot',skin:0,vt:'car',seat:0,ride:'',sl:0,held:'',heldCol:null,vehKey:'',tod:0.33,sit:0,an:'',rad:0,rx:0,rz:0};
   this.players.set(id,{ws:server,data,last:0,cid:rec.cid||''});
   if(rec.owner||!this.ownerId||!this.players.has(this.ownerId))this.ownerId=id;
 
   const others=[...this.players.values()].filter(p=>p.data.id!==id).map(p=>p.data);
-  this.send(server,{type:'welcome',id,isOwner:this.ownerId===id,ownerId:this.ownerId,roomName:this.cfg.roomName,started:this.cfg.started,players:others,count:this.players.size});
+  this.send(server,{type:'welcome',id,isOwner:this.ownerId===id,ownerId:this.ownerId,roomName:this.cfg.roomName,started:this.cfg.started,players:others,count:this.players.size,saved});
 
-  if(this.worldState.items.length||this.worldState.vehicles.length||this.worldState.removed.length)
-   this.send(server,{type:'world',...this.worldState});
+  const w=this.worldState;
+  if(Object.keys(w.vehicles).length||Object.keys(w.items).length||w.removed.length)
+   this.send(server,this.worldPayload());
 
   this.broadcast(id,{type:'joined',player:data,count:this.players.size});
   server.addEventListener('message',ev=>this.onMessage(id,ev));
@@ -144,10 +169,32 @@ export class Room{
   let m;
   try{m=JSON.parse(ev.data)}catch(e){return}
 
-  if(m.type==='ping'){this.send(p.ws,{type:'pong'});return}
+  if(m.type==='ping'){this.send(p.ws,{type:'pong'});await this.persist(false);return}
   if(m.type==='bye'){
    this.onLeave(id);
    try{p.ws.close(1000,'left')}catch(e){}
+   return;
+  }
+
+  if(m.type==='name'){
+   const nm=cleanText(m.name,18);
+   if(nm){p.data.name=nm;this.broadcast(id,{type:'state',player:p.data})}
+   return;
+  }
+
+  /* per-player saved inventory, kept per client id so it survives leaving the room */
+  if(m.type==='save'){
+   if(p.cid&&m.data&&typeof m.data==='object'){
+    const s=JSON.stringify(m.data);
+    if(s.length<8000)await this.state.storage.put('pd:'+p.cid,m.data);
+   }
+   return;
+  }
+
+  /* WebRTC signalling (radio streaming between players) */
+  if(m.type==='rtc'){
+   const t=this.players.get(String(m.to||''));
+   if(t&&typeof m.kind==='string')this.send(t.ws,{type:'rtc',from:id,kind:cleanText(m.kind,10),side:cleanText(m.side,2),data:m.data});
    return;
   }
 
@@ -177,62 +224,60 @@ export class Room{
     seat,ride:cleanText(m.ride,32),sl:m.sl?1:0,
     held:cleanText(m.held,32),
     heldCol:typeof m.heldCol==='string'?cleanText(m.heldCol,16):null,
-    vehKey:key,tod:this.num(m.tod,1)
+    vehKey:key,tod:this.num(m.tod,1),
+    sit:m.sit?1:0,an:cleanText(m.an,16),
+    rad:m.rad?1:0,rx:this.num(m.rx,1e6),rz:this.num(m.rz,1e6)
    });
    this.broadcast(id,{type:'state',player:p.data});
    return;
   }
 
+  /* world: only changes (deltas) are stored and relayed */
   if(m.type==='world'){
-   const removed=new Set(this.worldState.removed||[]);
-   for(const x of (Array.isArray(m.removed)?m.removed.slice(-500):[]))
-    if(typeof x==='string'&&x.length<=180)removed.add(x);
+   const w=this.worldState,remSet=new Set(w.removed),dv=[],di=[],dr=[];
 
-   if(removed.size>3000){
-    const keep=[...removed].slice(-2000);
-    removed.clear();keep.forEach(x=>removed.add(x));
+   for(const x of (Array.isArray(m.removed)?m.removed.slice(0,300):[])){
+    if(typeof x!=='string'||x.length>180||remSet.has(x))continue;
+    remSet.add(x);w.removed.push(x);dr.push(x);delete w.items[x];
    }
+   if(w.removed.length>3000)w.removed.splice(0,w.removed.length-2000);
 
-   const items=new Map((this.worldState.items||[]).map(x=>[x.netId,x]));
-   for(const x of (Array.isArray(m.items)?m.items.slice(0,180):[])){
-    if(!x||typeof x.netId!=='string'||x.netId.length>180||removed.has(x.netId)||typeof x.type!=='string'||!/^[a-zA-Z0-9:_-]+$/.test(x.type))continue;
-    items.set(x.netId,{
-     netId:x.netId,type:x.type,
+   for(const x of (Array.isArray(m.items)?m.items.slice(0,120):[])){
+    if(!x||typeof x.netId!=='string'||x.netId.length>180||!x.netId.startsWith('d:')||remSet.has(x.netId))continue;
+    if(typeof x.type!=='string'||!/^[a-zA-Z0-9:_-]+$/.test(x.type))continue;
+    const it={netId:x.netId,type:x.type,
      x:this.num(x.x,1e6),y:this.num(x.y,1000),z:this.num(x.z,1e6),
      ry:this.num(x.ry,100),uses:this.num(x.uses,10000),
-     col:typeof x.col==='string'?cleanText(x.col,16):null
-    });
+     col:typeof x.col==='string'?cleanText(x.col,16):null};
+    w.items[x.netId]=it;di.push(it);
    }
+   const ik=Object.keys(w.items);
+   if(ik.length>500)for(const k of ik.slice(0,ik.length-500))delete w.items[k];
 
-   for(const x of removed)items.delete(x);
-   const vehicles=new Map((this.worldState.vehicles||[]).map(x=>[x.key,x]));
-   for(const x of (Array.isArray(m.vehicles)?m.vehicles.slice(0,8):[])){
+   for(const x of (Array.isArray(m.vehicles)?m.vehicles.slice(0,12):[])){
     if(!x||typeof x.key!=='string'||x.key.length>100)continue;
-    const by=this.vehicleOwners.get(x.key);
-    if(by&&by!==id)continue;
-    if(!by&&!(p.data.mode==='car'&&p.data.seat===0&&p.data.vehKey===x.key))continue;
-    const ph=x.phys||{};
-    vehicles.set(x.key,{
-     key:x.key,
-     phys:{
-      x:this.num(ph.x,1e6),y:this.num(ph.y,1000),z:this.num(ph.z,1e6),
-      psi:this.num(ph.psi,100),v:this.num(ph.v,1000),steer:this.num(ph.steer,10)
-     },
-     state:x.state||{}
-    });
+    const e=w.vehicles[x.key]||(w.vehicles[x.key]={phys:null,state:{}}),out={key:x.key};
+    if(x.state&&typeof x.state==='object'&&JSON.stringify(x.state).length<20000){
+     Object.assign(e.state,x.state);out.state=x.state;
+    }
+    if(x.phys&&typeof x.phys==='object'){
+     const by=this.vehicleOwners.get(x.key);
+     if(!by||by===id){
+      const ph=x.phys;
+      e.phys={x:this.num(ph.x,1e6),y:this.num(ph.y,1000),z:this.num(ph.z,1e6),psi:this.num(ph.psi,100),v:this.num(ph.v,1000),steer:this.num(ph.steer,10)};
+      out.phys=e.phys;
+     }
+    }
+    if(out.state||out.phys)dv.push(out);
    }
+   const vk=Object.keys(w.vehicles);
+   if(vk.length>150)for(const k of vk.slice(0,vk.length-150))delete w.vehicles[k];
 
-   this.worldState={
-    vehicles:[...vehicles.values()].slice(-100),
-    items:[...items.values()].slice(-500),
-    removed:[...removed].slice(-2000)
-   };
-
-   if(Date.now()-this.lastWorldPersist>1000){
-    this.lastWorldPersist=Date.now();
-    await this.state.storage.put('worldState',this.worldState);
+   if(dv.length||di.length||dr.length){
+    this.dirty=true;
+    await this.persist(false);
+    this.broadcast(id,{type:'world',vehicles:dv,items:di,removed:dr});
    }
-   this.broadcast(id,{type:'world',...this.worldState});
    return;
   }
 
@@ -253,7 +298,9 @@ export class Room{
    this.ownerId=next||null;
    if(next)this.send(this.players.get(next).ws,{type:'owner',id:next});
   }
-  if(!this.players.size)await this.state.storage.setAlarm(Date.now()+120000);
+  await this.persist(true);
+  /* an empty room is kept for 30 days so friends can come back to the same world */
+  if(!this.players.size)await this.state.storage.setAlarm(Date.now()+ROOM_TTL);
  }
 
  async alarm(){
@@ -261,7 +308,7 @@ export class Room{
   if(!this.players.size){
    await this.state.storage.deleteAll();
    this.cfg=null;
-   this.worldState={vehicles:[],items:[],removed:[]};
+   this.worldState=normalizeWorld({});
   }else await this.state.storage.setAlarm(Date.now()+600000);
  }
 
